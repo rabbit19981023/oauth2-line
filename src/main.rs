@@ -1,6 +1,6 @@
 use axum::{
     extract::{Query, State},
-    response::{Html, IntoResponse, Redirect},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
     Router,
 };
@@ -61,10 +61,10 @@ impl AppState {
     }
 }
 
-impl Default for AuthState {
-    fn default() -> Self {
+impl AuthState {
+    fn new(csrf_token: CsrfToken) -> Self {
         Self {
-            csrf_token: CsrfToken::new_random(),
+            csrf_token,
             profile: None,
             access_token: None,
             refresh_token: None,
@@ -80,6 +80,21 @@ impl AuthState {
 
     fn set_profile(&mut self, profile: Profile) {
         self.profile = Some(profile);
+    }
+}
+
+#[derive(Debug)]
+enum AuthError {
+    NoSession,
+    NoAuthState,
+    InvalidState,
+    FetchTokenError,
+    FetchProfileError,
+}
+
+impl IntoResponse for AuthError {
+    fn into_response(self) -> Response {
+        Html(format!("<h1>Authentication Error: {:?}</h1>", self)).into_response()
     }
 }
 
@@ -108,28 +123,25 @@ async fn main() {
 }
 
 async fn index(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
-    let session_id = match jar.get("session_id") {
-        Some(session_id) => session_id.value(),
-        None => "",
-    };
+    let profile = jar
+        .get("session_id")
+        .map(|cookie| cookie.value())
+        .and_then(|session_id| state.get_auth_state(session_id))
+        .and_then(|auth_state| auth_state.profile);
 
-    match state.get_auth_state(session_id) {
-        Some(auth_state) => {
-            let profile = auth_state.profile.unwrap();
-
-            Html(format!(
-                r#"
-                    <h1>You are logged in!</h1>
-                    <pre>{}</pre>
-                    <a href="/auth/line">Login with Line</a>
-                "#,
-                serde_json::to_string_pretty(&profile).unwrap(),
-            ))
-        }
+    match profile {
+        Some(p) => Html(format!(
+            r#"
+                <h1>You are logged in!</h1>
+                <pre>{}</pre>
+                <a href="/auth/line">Login as another user</a>
+            "#,
+            serde_json::to_string_pretty(&p).unwrap(),
+        )),
         None => Html(
             r#"
                 <h1>Line OAuth Example</h1>
-                <a href="/auth/line">Login with Line</a>
+                <a href="/auth/line">Login</a>
             "#
             .to_string(),
         ),
@@ -138,83 +150,70 @@ async fn index(State(state): State<AppState>, jar: CookieJar) -> impl IntoRespon
 
 async fn line_auth(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
     let client = create_oauth_client();
-
     let session_id = Uuid::new_v4().to_string();
-    let auth_state = AuthState::default();
 
-    let (auth_url, _csrf_token) = client
-        .authorize_url(|| auth_state.csrf_token.clone())
+    let (auth_url, csrf_token) = client
+        .authorize_url(CsrfToken::new_random)
         .add_scope(Scope::new("profile".to_string()))
         .add_scope(Scope::new("openid".to_string()))
         .url();
 
-    state.set_auth_state(session_id.clone(), auth_state);
-    let updated_jar = jar.add(Cookie::build(("session_id", session_id)).path("/"));
+    state.set_auth_state(session_id.clone(), AuthState::new(csrf_token));
 
-    (updated_jar, Redirect::to(auth_url.as_str()))
+    (
+        jar.add(Cookie::build(("session_id", session_id)).path("/")),
+        Redirect::to(auth_url.as_str()),
+    )
 }
 
 async fn line_callback(
     State(state): State<AppState>,
     jar: CookieJar,
     Query(params): Query<AuthRequest>,
-) -> impl IntoResponse {
-    let session_id = jar.get("session_id").unwrap().value();
-    let csrf_token = state
-        .get_auth_state(session_id)
-        .unwrap()
-        .csrf_token
-        .secret()
-        .clone();
+) -> Result<impl IntoResponse, AuthError> {
+    let session_id = jar.get("session_id").ok_or(AuthError::NoSession)?.value();
 
-    if params.state != *csrf_token {
-        return Html("<h1>Invalid state</h1>".to_string());
-    }
+    match state.get_auth_state(session_id) {
+        Some(auth_state) if auth_state.csrf_token.secret() == &params.state => (),
+        Some(_) => return Err(AuthError::InvalidState),
+        None => return Err(AuthError::NoAuthState),
+    };
 
-    let client = create_oauth_client();
-
-    let token_result = client
+    let token = create_oauth_client()
         .exchange_code(AuthorizationCode::new(params.code))
         .request_async(oauth2::reqwest::async_http_client)
-        .await;
+        .await
+        .map_err(|_| AuthError::FetchTokenError)?;
 
-    match token_result {
-        Ok(token) => {
-            let mut auth_state = state.get_auth_state(session_id).unwrap();
+    let profile: Profile = reqwest::Client::new()
+        .get(env::var("LINE_API_PROFILE").unwrap())
+        .bearer_auth(token.access_token().secret())
+        .send()
+        .await
+        .map_err(|_| AuthError::FetchProfileError)?
+        .json()
+        .await
+        .unwrap();
 
-            auth_state.set_tokens(
-                token.access_token().secret().to_string(),
-                token.refresh_token().unwrap().secret().to_string(),
-            );
+    let mut auth_state = state
+        .get_auth_state(session_id)
+        .ok_or(AuthError::NoAuthState)?;
 
-            let client = reqwest::Client::new();
-            let profile_response = client
-                .get(env::var("LINE_API_PROFILE").unwrap())
-                .bearer_auth(token.access_token().secret())
-                .send()
-                .await;
+    auth_state.set_tokens(
+        token.access_token().secret().to_string(),
+        token.refresh_token().unwrap().secret().to_string(),
+    );
+    auth_state.set_profile(profile.clone());
+    state.set_auth_state(session_id.to_string(), auth_state);
 
-            match profile_response {
-                Ok(response) => {
-                    let profile: Profile = response.json().await.unwrap();
-
-                    auth_state.set_profile(profile.clone());
-                    state.set_auth_state(session_id.to_string(), auth_state);
-
-                    Html(format!(
-                        r#"
-                            <h1>Authentication Successful!</h1>
-                            <pre>{}</pre>
-                            <a href="/">Back to home</a>
-                        "#,
-                        serde_json::to_string_pretty(&profile).unwrap()
-                    ))
-                }
-                Err(e) => Html(format!("<h1>Error fetching profile: {}</h1>", e)),
-            }
-        }
-        Err(e) => Html(format!("<h1>Authentication Error: {}</h1>", e)),
-    }
+    Ok(Html(format!(
+        r#"
+            <h1>Authentication Successful!</h1>
+            <pre>{}</pre>
+            <a href="/">Back to home</a>
+        "#,
+        serde_json::to_string_pretty(&profile).unwrap()
+    )))
 }
 
 fn create_oauth_client() -> BasicClient {
